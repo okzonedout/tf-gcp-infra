@@ -11,7 +11,7 @@ resource "google_compute_network" "vpc_network" {
   delete_default_routes_on_create = each.value.delete_default_routes_on_create
 }
 
-resource "google_compute_subnetwork" "subnets" {
+esource "google_compute_subnetwork" "subnets" {
   for_each      = var.subnets
   name          = each.value.subnet_name
   ip_cidr_range = each.value.ip_cidr_range
