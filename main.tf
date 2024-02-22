@@ -54,7 +54,7 @@ resource "google_compute_instance" "instance-1" {
   network_interface {
     access_config {}
     network    = google_compute_network.vpc_network["vpc1"].self_link
-    subnetwork = "projects/csye6225-omkar/regions/us-east1/subnetworks/default"
+    subnetwork = google_compute_subnetwork.subnets["webapp-1"].self_link
   }
 }
 
