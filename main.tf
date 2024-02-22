@@ -25,3 +25,61 @@ resource "google_compute_route" "csye6225-vpc-1" {
   network          = google_compute_network.vpc_network["vpc1"].self_link
   next_hop_gateway = "default-internet-gateway"
 }
+
+data "google_compute_image" "my_image" {
+  family  = "centos-csye6225"
+  project = "csye6225-omkar"
+}
+
+resource "google_compute_instance" "instance-1" {
+  machine_type              = "n1-standard-1"
+  name                      = "instance-1"
+  zone                      = "us-east1-b"
+  allow_stopping_for_update = true
+
+  boot_disk {
+    auto_delete = true
+    device_name = "instance-1"
+
+    initialize_params {
+      # image = "projects/csye6225-omkar/global/images/centos-csye6225-1708497196"
+      image = data.google_compute_image.my_image.self_link
+      size  = 100
+      type  = "pd-balanced"
+    }
+
+    mode = "READ_WRITE"
+  }
+
+  network_interface {
+    access_config {}
+    network    = google_compute_network.vpc_network["vpc1"].self_link
+    subnetwork = "projects/csye6225-omkar/regions/us-east1/subnetworks/default"
+  }
+}
+
+resource "google_compute_firewall" "allow_http" {
+  name     = "allow-8080"
+  network  = google_compute_network.vpc_network["vpc1"].self_link
+  priority = 999
+
+  allow {
+    protocol = "tcp"
+    ports    = ["8080"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+}
+
+resource "google_compute_firewall" "deny_all" {
+  name     = "deny-all"
+  network  = google_compute_network.vpc_network["vpc1"].self_link
+  priority = 1000
+
+  deny {
+    protocol = "all"
+    ports    = []
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+}
