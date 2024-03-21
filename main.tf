@@ -90,6 +90,11 @@ resource "google_compute_instance" "instance-1" {
     mode = var.webapp_instance.mode
   }
 
+  service_account {
+    email = google_service_account.service_account.email
+    scopes = var.service_account_roles
+  }
+
   # Specifies the network attached to the instance 
   network_interface {
     # Access configurations, i.e. IPs via which this instance can be accessed via the Internet.
@@ -124,6 +129,23 @@ resource "google_compute_instance" "instance-1" {
 
 }
 
+resource "google_service_account" "service_account" {
+  account_id   = var.service_account.account_id
+  display_name = var.service_account.display_name
+}
+
+resource "google_project_iam_binding" "service_account_metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  members  = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
+resource "google_project_iam_binding" "service_account_log_admin" {
+  project = var.project_id
+  role    = "roles/logging.admin"
+  members  = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
 # Create a CloudSQL for PostgreSQL Instance
 resource "google_sql_database_instance" "postgres_instance" {
   name                = var.postgres_instance.name
@@ -151,7 +173,7 @@ resource "google_sql_database" "webappdb" {
 
 resource "random_password" "sql_random_password" {
   length           = 16
-  special          = true
+  special          = false
   override_special = "!#$%&*()-_=+[]{}<>:?"
 }
 
@@ -164,4 +186,18 @@ resource "google_sql_user" "users" {
   name     = var.webappdb.username
   instance = google_sql_database_instance.postgres_instance.name
   password = random_password.sql_random_password.result
+}
+
+resource "google_dns_record_set" "webapp_dns_record_set" {
+  name = data.google_dns_managed_zone.webapp-zone.dns_name
+  type = "A"
+  ttl  = 300
+
+  managed_zone = data.google_dns_managed_zone.webapp-zone.name
+
+  rrdatas = [google_compute_instance.instance-1.network_interface[0].access_config[0].nat_ip]
+}
+
+data "google_dns_managed_zone" "webapp-zone" {
+  name = var.public_zone_name
 }
