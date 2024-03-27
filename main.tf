@@ -26,6 +26,7 @@ resource "google_compute_subnetwork" "subnets" {
 # Allocates an internal IP range for VPC peering within the specified VPC network.
 resource "google_compute_global_address" "private_ip_address" {
   name          = var.private_ip_address.name
+  project       = var.project_id
   purpose       = var.private_ip_address.purpose
   address_type  = var.private_ip_address.address_type
   prefix_length = var.private_ip_address.prefix_length
@@ -92,7 +93,8 @@ resource "google_compute_instance" "instance-1" {
 
   service_account {
     email = google_service_account.service_account.email
-    scopes = var.service_account_roles
+    # scopes = var.service_account_roles
+    scopes = ["cloud-platform"]
   }
 
   # Specifies the network attached to the instance 
@@ -130,25 +132,33 @@ resource "google_compute_instance" "instance-1" {
 }
 
 resource "google_service_account" "service_account" {
-  account_id   = var.service_account.account_id
-  display_name = var.service_account.display_name
+  account_id                   = var.service_account.account_id
+  display_name                 = var.service_account.display_name
+  create_ignore_already_exists = true
 }
 
 resource "google_project_iam_binding" "service_account_metric_writer" {
   project = var.project_id
   role    = "roles/monitoring.metricWriter"
-  members  = ["serviceAccount:${google_service_account.service_account.email}"]
+  members = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
+resource "google_project_service" "project" {
+  project            = var.project_id
+  service            = "servicenetworking.googleapis.com"
+  disable_on_destroy = false
 }
 
 resource "google_project_iam_binding" "service_account_log_admin" {
   project = var.project_id
   role    = "roles/logging.admin"
-  members  = ["serviceAccount:${google_service_account.service_account.email}"]
+  members = ["serviceAccount:${google_service_account.service_account.email}"]
 }
 
 # Create a CloudSQL for PostgreSQL Instance
 resource "google_sql_database_instance" "postgres_instance" {
   name                = var.postgres_instance.name
+  project             = var.project_id
   region              = var.region
   database_version    = var.postgres_instance.database_version
   root_password       = var.postgres_instance.root_password
@@ -160,8 +170,9 @@ resource "google_sql_database_instance" "postgres_instance" {
     disk_type         = var.postgres_instance.disk_type
     disk_size         = var.postgres_instance.disk_size
     ip_configuration {
-      ipv4_enabled    = var.postgres_instance.ipv4_enabled
-      private_network = google_compute_network.vpc_network["vpc1"].self_link
+      ipv4_enabled                                  = var.postgres_instance.ipv4_enabled
+      private_network                               = google_compute_network.vpc_network["vpc1"].self_link
+      enable_private_path_for_google_cloud_services = true
     }
   }
 }
@@ -200,4 +211,143 @@ resource "google_dns_record_set" "webapp_dns_record_set" {
 
 data "google_dns_managed_zone" "webapp-zone" {
   name = var.public_zone_name
+}
+
+resource "google_project_iam_binding" "service_account_token_creator" {
+  project = var.project_id
+  role    = "roles/iam.serviceAccountTokenCreator"
+  members = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
+resource "google_cloudfunctions2_function_iam_member" "invoker" {
+  project        = google_cloudfunctions2_function.function.project
+  location       = google_cloudfunctions2_function.function.location
+  cloud_function = google_cloudfunctions2_function.function.name
+  role           = "roles/cloudfunctions.invoker"
+  member         = "serviceAccount:${google_service_account.service_account.email}"
+}
+
+resource "google_cloud_run_service_iam_member" "cloud_run_invoker" {
+  project  = google_cloudfunctions2_function.function.project
+  location = google_cloudfunctions2_function.function.location
+  service  = google_cloudfunctions2_function.function.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.service_account.email}"
+}
+
+resource "google_cloudfunctions2_function_iam_binding" "binding" {
+  cloud_function = google_cloudfunctions2_function.function.name
+  location       = google_cloudfunctions2_function.function.location
+  role           = "roles/viewer"
+  members        = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
+resource "google_pubsub_subscription_iam_binding" "editor" {
+  subscription = google_pubsub_subscription.webapp_subscription.name
+  role         = "roles/editor"
+  members      = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
+resource "google_pubsub_topic_iam_binding" "binding" {
+  project = google_pubsub_topic.webapp_topic.project
+  topic   = google_pubsub_topic.webapp_topic.name
+  role    = "roles/pubsub.editor"
+  members = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
+# Create a topic
+resource "google_pubsub_topic" "webapp_topic" {
+  name                       = "verify_email"
+  message_retention_duration = "604800s"
+}
+
+# Create subscription
+resource "google_pubsub_subscription" "webapp_subscription" {
+  name                       = "webapp_subscription"
+  topic                      = google_pubsub_topic.webapp_topic.id
+  message_retention_duration = "604800s"
+  retain_acked_messages      = true
+  expiration_policy {
+    ttl = "604800s"
+  }
+  enable_exactly_once_delivery = true
+  enable_message_ordering      = true
+}
+
+# Create bucket to store Cloud function
+resource "google_storage_bucket" "bucket" {
+  name                        = "${var.project_id}-gcf-source"
+  location                    = "US"
+  uniform_bucket_level_access = true
+}
+
+# Store Cloud function in the bucket
+resource "google_storage_bucket_object" "object" {
+  name   = "function-source.zip"
+  bucket = google_storage_bucket.bucket.name
+  source = "function-source.zip" # Add path to the zipped function source code
+}
+
+resource "google_project_iam_binding" "service_account_sql_client" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  members = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
+resource "google_vpc_access_connector" "connector" {
+  name          = "connector"
+  ip_cidr_range = "10.8.0.0/28"
+  region        = var.region
+  network       = google_compute_network.vpc_network["vpc1"].self_link
+}
+
+# Create cloud function based on the zip in bucket
+resource "google_cloudfunctions2_function" "function" {
+  name        = "webapp-email"
+  location    = "us-east1"
+  description = "webapp-function"
+
+  # Cloud function build configuration
+  build_config {
+    runtime     = "java21"
+    entry_point = "gcfv2pubsub.PubSubFunction" # Set the entry point 
+    # Cloud function source
+    source {
+      storage_source {
+        bucket = google_storage_bucket.bucket.name
+        object = google_storage_bucket_object.object.name
+      }
+    }
+  }
+
+  # Service configuration linked to service account
+  service_config {
+    max_instance_count               = 1
+    available_memory                 = "128Mi"
+    timeout_seconds                  = 120
+    max_instance_request_concurrency = 1
+    available_cpu                    = "1"
+    service_account_email            = google_service_account.service_account.email
+    vpc_connector                    = google_vpc_access_connector.connector.name
+    vpc_connector_egress_settings    = "PRIVATE_RANGES_ONLY"
+    all_traffic_on_latest_revision   = true
+    environment_variables = {
+      DB_USER       = "${google_sql_user.users.name}"
+      DB_PASS       = "${random_password.sql_random_password.result}"
+      DB_NAME       = "${google_sql_database.webappdb.name}"
+      INSTANCE_HOST = "${google_sql_database_instance.postgres_instance.private_ip_address}"
+      DB_PORT       = "5432"
+    }
+
+  }
+
+  # Event Trigger linked to service account
+  event_trigger {
+    trigger_region        = var.region
+    event_type            = "google.cloud.pubsub.topic.v1.messagePublished"
+    pubsub_topic          = google_pubsub_topic.webapp_topic.id
+    retry_policy          = "RETRY_POLICY_RETRY"
+    service_account_email = google_service_account.service_account.email
+  }
+
 }
