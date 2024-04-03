@@ -50,7 +50,7 @@ resource "google_compute_firewall" "allow_http" {
     ports    = var.allowed_ports
   }
 
-  source_ranges = ["0.0.0.0/0"]
+  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
   target_tags   = var.tags_for_instances
 }
 
