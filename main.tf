@@ -1,6 +1,7 @@
 provider "google" {
   project = var.project_id
   region  = var.region
+  zone    = var.public_zone_name
 }
 
 # Create VPCs based on the "vpcs" map in variables
@@ -67,43 +68,90 @@ data "google_compute_image" "my_image" {
   project = var.custom_images.project
 }
 
-# Create instance based on the latest custom image
-resource "google_compute_instance" "instance-1" {
-  machine_type              = var.webapp_instance.machine_type
-  name                      = var.webapp_instance.name
-  zone                      = var.webapp_instance.zone
-  allow_stopping_for_update = var.webapp_instance.allow_stopping_for_update
-  tags                      = var.tags_for_instances
-  # Set 100GB of storage disk for the instance
-  boot_disk {
-    auto_delete = var.webapp_instance.boot_disk_auto_delete
-    device_name = var.webapp_instance.boot_disk_device_name
-
-    # Parametes for disk storage
-    initialize_params {
-      # image = "projects/csye6225-omkar/global/images/centos-csye6225-1708497196"
-      image = data.google_compute_image.my_image.self_link
-      size  = var.webapp_instance.boot_disk_size
-      type  = var.webapp_instance.boot_disk_type
-    }
-
-    # Sets mode of the disk
-    mode = var.webapp_instance.mode
+# Create instance group manager - MIG
+resource "google_compute_region_instance_group_manager" "webapp_instance_group_manager" {
+  name                      = "webapp-instance-group-manager"
+  base_instance_name        = "webapp"
+  region                    = var.region
+  distribution_policy_zones = ["us-east1-b", "us-east1-c", "us-east1-d"]
+  # target_pools = []
+  target_size = 1
+  version {
+    instance_template = google_compute_region_instance_template.webapp_instance_template.self_link
+    name              = "primary"
+  }
+  named_port {
+    name = "http"
+    port = 8080
+  }
+  auto_healing_policies {
+    health_check      = google_compute_region_health_check.autohealing.id
+    initial_delay_sec = 60
   }
 
+}
+
+resource "google_compute_region_health_check" "autohealing" {
+  name                = "autohealing-health-check"
+  check_interval_sec  = 60
+  timeout_sec         = 60
+  healthy_threshold   = 2
+  unhealthy_threshold = 10 # 50 seconds
+
+  http_health_check {
+    request_path = "/healthz"
+    port         = "8080"
+  }
+}
+
+resource "google_compute_region_autoscaler" "webapp_autoscaler" {
+  name       = "webapp-autoscaler"
+  region     = var.region
+  target     = google_compute_region_instance_group_manager.webapp_instance_group_manager.id
+  depends_on = [google_compute_region_instance_group_manager.webapp_instance_group_manager]
+  autoscaling_policy {
+    mode            = "ON"
+    max_replicas    = 9
+    min_replicas    = 1
+    cooldown_period = 60
+    # load_balancing_utilization {
+    #   target = 0.5
+    # }
+    cpu_utilization {
+      target = 0.5
+    }
+  }
+}
+
+# Create instance template
+resource "google_compute_region_instance_template" "webapp_instance_template" {
+  name_prefix  = "webapp-template"
+  tags         = var.tags_for_instances
+  labels       = { env = "production" }
+  region       = var.region
+  machine_type = var.webapp_instance.machine_type
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  disk {
+    # source_image = google_compute_disk.webapp_disk.source_image_id
+    source_image = data.google_compute_image.my_image.family
+    auto_delete  = false
+    boot         = false
+    disk_size_gb = 100
+  }
+
+  network_interface {
+    network    = google_compute_network.vpc_network["vpc1"].self_link
+    subnetwork = google_compute_subnetwork.subnets["webapp-1"].self_link
+  }
   service_account {
     email = google_service_account.service_account.email
     # scopes = var.service_account_roles
     scopes = ["cloud-platform"]
   }
 
-  # Specifies the network attached to the instance 
-  network_interface {
-    # Access configurations, i.e. IPs via which this instance can be accessed via the Internet.
-    access_config {}
-    network    = google_compute_network.vpc_network["vpc1"].self_link
-    subnetwork = google_compute_subnetwork.subnets["webapp-1"].self_link
-  }
   metadata = {
     startup-script = <<-EOF
     #! /bin/bash
@@ -128,19 +176,84 @@ resource "google_compute_instance" "instance-1" {
     # systemctl restart webapp.service
     EOF
   }
-
 }
+
+resource "google_compute_disk" "webapp_disk" {
+  name  = "webapp-disk"
+  image = data.google_compute_image.my_image.self_link
+  type  = var.webapp_instance.boot_disk_type
+  size  = var.webapp_instance.boot_disk_size
+  zone  = var.webapp_instance.zone
+}
+
+# Create instance based on the latest custom image
+# resource "google_compute_instance" "instance-1" {
+#   machine_type              = var.webapp_instance.machine_type
+#   name                      = var.webapp_instance.name
+#   zone                      = var.webapp_instance.zone
+#   allow_stopping_for_update = var.webapp_instance.allow_stopping_for_update
+#   tags                      = var.tags_for_instances
+#   # Set 100GB of storage disk for the instance
+#   boot_disk {
+#     auto_delete = var.webapp_instance.boot_disk_auto_delete
+#     device_name = var.webapp_instance.boot_disk_device_name
+
+#     # Parametes for disk storage
+#     initialize_params {
+#       # image = "projects/csye6225-omkar/global/images/centos-csye6225-1708497196"
+#       image = data.google_compute_image.my_image.self_link
+#       size  = var.webapp_instance.boot_disk_size
+#       type  = var.webapp_instance.boot_disk_type
+#     }
+
+#     # Sets mode of the disk
+#     mode = var.webapp_instance.mode
+#   }
+
+#   service_account {
+#     email = google_service_account.service_account.email
+#     # scopes = var.service_account_roles
+#     scopes = ["cloud-platform"]
+#   }
+
+#   # Specifies the network attached to the instance 
+#   network_interface {
+#     # Access configurations, i.e. IPs via which this instance can be accessed via the Internet.
+#     access_config {}
+#     network    = google_compute_network.vpc_network["vpc1"].self_link
+#     subnetwork = google_compute_subnetwork.subnets["webapp-1"].self_link
+#   }
+#   metadata = {
+#     startup-script = <<-EOF
+#     #! /bin/bash
+
+#     # sudo touch /opt/application.properties
+
+#     sudo tee /opt/application.properties <<'EOT'
+#     spring.datasource.driver-class-name=org.postgresql.Driver
+#     spring.datasource.url=jdbc:postgresql://${google_sql_database_instance.postgres_instance.private_ip_address}:5432/${google_sql_database.webappdb.name}
+#     spring.datasource.username=${google_sql_user.users.name}
+#     spring.datasource.password=${random_password.sql_random_password.result}
+#     spring.jpa.hibernate.ddl-auto=update
+#     spring.jooq.sql-dialect=postgres
+#     spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
+#     server.port=8080
+#     spring.jackson.deserialization.fail-on-unknown-properties=true
+#     spring.sql.init.continue-on-error=true
+#     # Additional properties can be added here
+#     EOT
+
+#     # Restart or start your Spring Boot application as needed
+#     # systemctl restart webapp.service
+#     EOF
+#   }
+
+# }
 
 resource "google_service_account" "service_account" {
   account_id                   = var.service_account.account_id
   display_name                 = var.service_account.display_name
   create_ignore_already_exists = true
-}
-
-resource "google_project_iam_binding" "service_account_metric_writer" {
-  project = var.project_id
-  role    = "roles/monitoring.metricWriter"
-  members = ["serviceAccount:${google_service_account.service_account.email}"]
 }
 
 resource "google_project_service" "project" {
@@ -152,6 +265,18 @@ resource "google_project_service" "project" {
 resource "google_project_iam_binding" "service_account_log_admin" {
   project = var.project_id
   role    = "roles/logging.admin"
+  members = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
+resource "google_project_iam_binding" "service_account_token_creator" {
+  project = var.project_id
+  role    = "roles/iam.serviceAccountTokenCreator"
+  members = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
+resource "google_project_iam_binding" "service_account_metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
   members = ["serviceAccount:${google_service_account.service_account.email}"]
 }
 
@@ -199,24 +324,8 @@ resource "google_sql_user" "users" {
   password = random_password.sql_random_password.result
 }
 
-resource "google_dns_record_set" "webapp_dns_record_set" {
-  name = data.google_dns_managed_zone.webapp-zone.dns_name
-  type = "A"
-  ttl  = 300
-
-  managed_zone = data.google_dns_managed_zone.webapp-zone.name
-
-  rrdatas = [google_compute_instance.instance-1.network_interface[0].access_config[0].nat_ip]
-}
-
 data "google_dns_managed_zone" "webapp-zone" {
   name = var.public_zone_name
-}
-
-resource "google_project_iam_binding" "service_account_token_creator" {
-  project = var.project_id
-  role    = "roles/iam.serviceAccountTokenCreator"
-  members = ["serviceAccount:${google_service_account.service_account.email}"]
 }
 
 resource "google_cloudfunctions2_function_iam_member" "invoker" {
@@ -350,4 +459,63 @@ resource "google_cloudfunctions2_function" "function" {
     service_account_email = google_service_account.service_account.email
   }
 
+}
+
+module "gce-lb-http" {
+  source  = "terraform-google-modules/lb-http/google"
+  version = "~> 10.0"
+  name    = "loadbalancer"
+  project = var.project_id
+
+  ssl                             = true
+  managed_ssl_certificate_domains = ["omkar-sde.me"]
+  http_forward                    = false
+
+  create_address = true
+
+  network = google_compute_network.vpc_network["vpc1"].name
+
+  # firewall_networks = [google_compute_network.vpc_network["vpc1"].name]
+
+  backends = {
+    default = {
+
+      protocol    = "HTTP"
+      port_name   = "http"
+      timeout_sec = 60
+      enable_cdn  = false
+
+      health_check = {
+        request_path        = "/healthz"
+        port                = 8080
+        healthy_threshold   = 3
+        unhealthy_threshold = 5
+        logging             = true
+      }
+
+      log_config = {
+        enable      = true
+        sample_rate = 1.0
+      }
+
+      groups = [
+        {
+          group = google_compute_region_instance_group_manager.webapp_instance_group_manager.instance_group
+        }
+      ]
+
+      iap_config = {
+        enable = false
+      }
+    }
+  }
+}
+
+
+resource "google_dns_record_set" "webapp_dns_record_set" {
+  name         = data.google_dns_managed_zone.webapp-zone.dns_name
+  type         = "A"
+  ttl          = 300
+  managed_zone = data.google_dns_managed_zone.webapp-zone.name
+  rrdatas      = [module.gce-lb-http.external_ip]
 }
