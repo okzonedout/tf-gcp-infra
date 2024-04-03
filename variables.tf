@@ -62,7 +62,7 @@ variable "tags_for_instances" {
 
 variable "allowed_ports" {
   description = "Allowed ports for instance"
-  type        = tuple([string])
+  type        = list(string)
 }
 
 variable "allowed_protocol" {
@@ -111,4 +111,22 @@ variable "webappdb" {
     name     = string
     username = string
   })
+}
+
+variable "service_account_roles" {
+  description = "Service account roles for logging and monitoring"
+  type = list(string)
+}
+
+variable "service_account" {
+  description = "Service account information"
+  type = object({
+    account_id = string
+    display_name = string
+  })
+}
+
+variable "public_zone_name" {
+  description = "Public zone name"
+  type = string
 }
