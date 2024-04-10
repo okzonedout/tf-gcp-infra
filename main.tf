@@ -50,8 +50,10 @@ resource "google_compute_firewall" "allow_http" {
     ports    = var.allowed_ports
   }
 
+
   source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
-  target_tags   = var.tags_for_instances
+  # source_ranges = ["0.0.0.0/0"]
+  target_tags = var.tags_for_instances
 }
 
 # Create default internet gatewway for a VPC
@@ -97,6 +99,9 @@ resource "google_compute_region_health_check" "autohealing" {
   timeout_sec         = 60
   healthy_threshold   = 2
   unhealthy_threshold = 10 # 50 seconds
+  log_config {
+    enable = true
+  }
 
   http_health_check {
     request_path = "/healthz"
@@ -130,6 +135,7 @@ resource "google_compute_region_instance_template" "webapp_instance_template" {
   labels       = { env = "production" }
   region       = var.region
   machine_type = var.webapp_instance.machine_type
+  depends_on   = [google_kms_crypto_key.vm_key]
   lifecycle {
     create_before_destroy = true
   }
@@ -137,8 +143,11 @@ resource "google_compute_region_instance_template" "webapp_instance_template" {
   disk {
     # source_image = google_compute_disk.webapp_disk.source_image_id
     source_image = data.google_compute_image.my_image.family
-    auto_delete  = false
-    boot         = false
+    disk_encryption_key {
+      kms_key_self_link = google_kms_crypto_key.vm_key.id
+    }
+    auto_delete  = var.webapp_instance.boot_disk_auto_delete
+    boot         = true
     disk_size_gb = 100
   }
 
@@ -288,7 +297,7 @@ resource "google_sql_database_instance" "postgres_instance" {
   database_version    = var.postgres_instance.database_version
   root_password       = var.postgres_instance.root_password
   deletion_protection = var.postgres_instance.deletion_protection
-  depends_on          = [google_service_networking_connection.private_service_connection]
+  depends_on          = [google_service_networking_connection.private_service_connection, google_kms_crypto_key.cloudsql_key]
   settings {
     tier              = var.postgres_instance.tier
     availability_type = var.postgres_instance.availability_type
@@ -300,6 +309,8 @@ resource "google_sql_database_instance" "postgres_instance" {
       enable_private_path_for_google_cloud_services = true
     }
   }
+  encryption_key_name = google_kms_crypto_key.cloudsql_key.id
+
 }
 
 resource "google_sql_database" "webappdb" {
@@ -386,8 +397,12 @@ resource "google_pubsub_subscription" "webapp_subscription" {
 # Create bucket to store Cloud function
 resource "google_storage_bucket" "bucket" {
   name                        = "${var.project_id}-gcf-source"
-  location                    = "US"
+  location                    = var.region
   uniform_bucket_level_access = true
+  depends_on                  = [google_kms_crypto_key_iam_binding.bindingforstoragebucket]
+  encryption {
+    default_kms_key_name = google_kms_crypto_key.bucket_key.id
+  }
 }
 
 # Store Cloud function in the bucket
@@ -400,6 +415,12 @@ resource "google_storage_bucket_object" "object" {
 resource "google_project_iam_binding" "service_account_sql_client" {
   project = var.project_id
   role    = "roles/cloudsql.client"
+  members = ["serviceAccount:${google_service_account.service_account.email}"]
+}
+
+resource "google_project_iam_binding" "kms" {
+  project = var.project_id
+  role    = "roles/cloudkms.admin"
   members = ["serviceAccount:${google_service_account.service_account.email}"]
 }
 
@@ -492,6 +513,7 @@ module "gce-lb-http" {
         unhealthy_threshold = 5
         logging             = true
       }
+      # health_check = google_compute_region_health_check.autohealing
 
       log_config = {
         enable      = true
@@ -518,4 +540,207 @@ resource "google_dns_record_set" "webapp_dns_record_set" {
   ttl          = 300
   managed_zone = data.google_dns_managed_zone.webapp-zone.name
   rrdatas      = [module.gce-lb-http.external_ip]
+}
+
+# Assignment 9
+
+resource "random_id" "keyringsuffix" {
+  byte_length = 4
+}
+
+resource "google_kms_key_ring" "webapp_key_ring" {
+  name     = "webapp_keyring-${random_id.keyringsuffix.hex}"
+  location = var.region
+}
+
+# CMEK for VMs
+resource "google_kms_crypto_key" "vm_key" {
+  name            = "vm_key"
+  key_ring        = google_kms_key_ring.webapp_key_ring.id
+  rotation_period = "2592000s"
+
+  lifecycle {
+    prevent_destroy = false
+
+  }
+}
+
+# CMEK for CloudSQL
+resource "google_kms_crypto_key" "cloudsql_key" {
+  name            = "cloudsql_key"
+  key_ring        = google_kms_key_ring.webapp_key_ring.id
+  rotation_period = "2592000s"
+
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
+# CMEK for buckets
+resource "google_kms_crypto_key" "bucket_key" {
+  name            = "bucket_key"
+  key_ring        = google_kms_key_ring.webapp_key_ring.id
+  rotation_period = "2592000s"
+
+  lifecycle {
+    prevent_destroy = false
+  }
+}
+
+# Service account
+resource "google_project_service_identity" "cloudsql_sa" {
+  provider = google-beta
+  project  = var.project_id
+  service  = "sqladmin.googleapis.com"
+}
+
+# IAM binding CloudSQL
+resource "google_kms_crypto_key_iam_binding" "crypto_key" {
+  crypto_key_id = google_kms_crypto_key.cloudsql_key.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+
+  members = [
+    "serviceAccount:${google_project_service_identity.cloudsql_sa.email}",
+  ]
+}
+
+data "google_storage_project_service_account" "storagebucketserviceaccount" {
+
+}
+
+# IAM binding bucket
+resource "google_kms_crypto_key_iam_binding" "bindingforstoragebucket" {
+  provider      = google-beta
+  crypto_key_id = google_kms_crypto_key.bucket_key.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  members = [
+    "serviceAccount:${data.google_storage_project_service_account.storagebucketserviceaccount.email_address}",
+  ]
+
+}
+
+# IAM binding VMs
+resource "google_kms_crypto_key_iam_binding" "bindingforvminstanvetemplate" {
+  provider      = google-beta
+  crypto_key_id = google_kms_crypto_key.vm_key.id
+  role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+  members       = ["serviceAccount:service-757244847252@compute-system.iam.gserviceaccount.com"]
+}
+
+# Secret Manger
+resource "google_secret_manager_secret" "db_name" {
+  secret_id = "db-name"
+  labels    = { label = "db-name" }
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "db_host" {
+  secret_id = "db-host"
+  labels    = { label = "db-host" }
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "db_user" {
+  secret_id = "db-user"
+  labels    = { label = "db-user" }
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "db_password" {
+  secret_id = "db-password"
+  labels    = { label = "db-password" }
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "webbapp_service_account" {
+  secret_id = "webapp-service-account"
+  labels    = { label = "webapp-service-account" }
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "vm_instance_key" {
+  secret_id = "vm-instance-key"
+  labels    = { label = "vm-instance-key" }
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "region" {
+  secret_id = "region"
+  labels    = { label = "region" }
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "subnet" {
+  secret_id = "subnet"
+  labels    = { label = "subnet" }
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret" "instance_group_name" {
+  secret_id = "instance-group-name"
+  labels    = { label = "instance-group-name" }
+  replication {
+    auto {}
+  }
+}
+
+# Secret Versions
+resource "google_secret_manager_secret_version" "db_name" {
+  secret      = google_secret_manager_secret.db_name.id
+  secret_data = google_sql_database.webappdb.name
+}
+
+resource "google_secret_manager_secret_version" "db_host" {
+  secret      = google_secret_manager_secret.db_host.id
+  secret_data = google_sql_database_instance.postgres_instance.private_ip_address
+}
+
+resource "google_secret_manager_secret_version" "db_user" {
+  secret      = google_secret_manager_secret.db_user.id
+  secret_data = google_sql_user.users.name
+}
+
+resource "google_secret_manager_secret_version" "db_password" {
+  secret      = google_secret_manager_secret.db_password.id
+  secret_data = random_password.sql_random_password.result
+}
+
+resource "google_secret_manager_secret_version" "webbapp_service_account" {
+  secret      = google_secret_manager_secret.webbapp_service_account.id
+  secret_data = google_service_account.service_account.email
+}
+resource "google_secret_manager_secret_version" "vm_instance_key" {
+  secret      = google_secret_manager_secret.vm_instance_key.id
+  secret_data = google_kms_crypto_key.vm_key.id
+}
+
+resource "google_secret_manager_secret_version" "region" {
+  secret      = google_secret_manager_secret.region.id
+  secret_data = var.region
+}
+
+resource "google_secret_manager_secret_version" "subnet" {
+  secret      = google_secret_manager_secret.subnet.id
+  secret_data = "webapp-1"
+}
+
+resource "google_secret_manager_secret_version" "instance_group_name" {
+  secret      = google_secret_manager_secret.instance_group_name.id
+  secret_data = google_compute_region_instance_group_manager.webapp_instance_group_manager.name
 }
